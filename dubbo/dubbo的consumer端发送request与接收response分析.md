@@ -1,5 +1,7 @@
-DubboInver的inverker方法开始说起。
-从上篇文章可看到，在执行request时，是从DubboProtocol的refer()方法里拿到一个`DubboInvoker`实例，然后就从protocol层进入exchanger层。经过上面的分析我们已经看到，client其实是一个包装了很多层并且经过多次代理转发的过程。首先client实例是`ReferenceCountExchangeClient`,直接转发给`HeaderExchangeClient`
+##### 本篇内容主要分析consumer端request和response是如何在Exchanger层和Transport层流转。
+* 如何发送request请求
+
+从上篇文章可看到，在执行request时，是从DubboProtocol的refer()方法里拿到一个`DubboInvoker`实例，然后request就从protocol层进入exchanger层。DubboInvoker里的client其实是一个被包装了很多层的实例。首先从`ReferenceCountExchangeClient`说起，ReferenceCountExchangeClient拿到请求后把请求直接转发给了`HeaderExchangeClient`
 ```java
 @Override
    protected Result doInvoke(final Invocation invocation) throws Throwable {
@@ -47,7 +49,7 @@ DubboInver的inverker方法开始说起。
             throw new IllegalArgumentException("client == null");
         }
         this.client = client;
-        //channel实例化 注意是把client传递给了HeaderExchangeChannel
+        //channel实例化 注意client被传递给了HeaderExchangeChannel
         this.channel = new HeaderExchangeChannel(client);
         String dubbo = client.getUrl().getParameter(Constants.DUBBO_VERSION_KEY);
         this.heartbeat = client.getUrl().getParameter(Constants.HEARTBEAT_KEY, dubbo != null && dubbo.startsWith("1.0.") ? Constants.DEFAULT_HEARTBEAT : 0);
@@ -59,8 +61,8 @@ DubboInver的inverker方法开始说起。
             startHeartbeatTimer();
         }
     }
-    ```
-再来到`HeaderExchangeChannel`的request方法，发现是又转给了channel，那么我们可以推测，这个channel应该就是transport层的channel了,而这channel就是之前提到的NettyClient，这里把request的抽象，转到了transport层的send方法
+```
+再来到`HeaderExchangeChannel`的request方法，发现是又转给了`channel.send()`，那么我们可以推测，这个channel应该就是transport层的channel了,其实这channel就是之前提到的NettyClient，这里request从exchange层流转到了transport层
 ```java
 public ResponseFuture request(Object request, int timeout) throws RemotingException {
         if (closed) {
@@ -81,13 +83,13 @@ public ResponseFuture request(Object request, int timeout) throws RemotingExcept
         return future;
     }
   ```
-  `NettyClient`继承的类有点多，就不一一列列举了，从顶级父类`AbstractPeer`的send方法执行到，`AbstractClient`的send方法:
+  `NettyClient`继承的类有点多，就不一一列列举了，具体就是从父类`AbstractPeer`的send方法一直执行到`AbstractClient`的send方法，`AbstractClient`的send方法如下:
   ```java
   public void send(Object message, boolean sent) throws RemotingException {
        if (send_reconnect && !isConnected()) {
            connect();
        }
-       //注意这里有一个getChannel方法，子类需要实现的方法，
+       //注意这里有一个getChannel方法，是子类需要实现的方法，
        //咋们看下NettyClient的实现就知道什么意思了
        Channel channel = getChannel();
        //TODO Can the value returned by getChannel() be null? need improvement.
@@ -97,10 +99,10 @@ public ResponseFuture request(Object request, int timeout) throws RemotingExcept
        channel.send(message, sent);
    }
    ```
-   `NettyClient`的getChannel()实现如下，感觉挺绕的，到了这里又多出来个NettyChannel
+   `NettyClient`的getChannel()实现可以看到，是直接NettyClient的channel成员变量包装了下返回了，这个channel就是Netty的原生channel对象。
    ```java
    @Override
-   protected com.alibaba.dubbo.remoting.Channel getChannel() {
+   protected com.alibaba.dubbo.remoing.Channel getChannel() {
      //这里把connect()方法建立的channel对象赋值过来（SocketChannel）
        Channel c = channel;
        if (c == null || !c.isConnected())
@@ -108,7 +110,7 @@ public ResponseFuture request(Object request, int timeout) throws RemotingExcept
        return NettyChannel.getOrAddChannel(c, getUrl(), this);
    }
    ```
-   `NettyChannel`的getOrAddChannel如下,这里看到是以Netty原生的channel对象为key，包装了一层自己Channel然后存起来了，这个NettyChannel有其特殊作用的，后面会讲到
+   感觉挺绕的，到了这里又多出来个NettyChannel，`NettyChannel`的getOrAddChannel如下代码所示,是用NettyChannel对象包装了Netty原生channel,然后以Netty原生的channel对象为key，存起来了。这NettyChannel是实现了dubbo的channel接口，主要实现了写事件。
    ```java
    static NettyChannel getOrAddChannel(org.jboss.netty.channel.Channel ch, URL url, ChannelHandler handler) {
         if (ch == null) {
@@ -152,13 +154,15 @@ public ResponseFuture request(Object request, int timeout) throws RemotingExcept
        }
    }
    ```
-回到`AbstractClient`的send方法里，拿到channel之后，又执行了channel的send方法，其实就是执行了`NettyChannel`的send方法，看上面的代码可以看到，到这里终于调用了Netty原生的channel把数据写出去了，也就是NettyClient建立连接后获取的channel写出去了
+回到`AbstractClient`的send方法里，拿到channel之后，又执行了channel的send方法，其实就是执行了`NettyChannel`的send方法，看上面的代码可以看到，是调用了Netty原生的channel把数据写出去了，也就是NettyClient建立连接后获取的channel写出去了
 
-看到这里之后，感觉dubbo发送个请求真的是太绕了，绕晕了有没有.
+到这里，request就已经发送出去了。感觉dubbo发送个请求真的是太绕了，绕晕了有没有.
 
 ---
+* 如何处理返回的Response结果
 
-发送完request之后还得处理返回的response，response的处理应该由handler来完成，即需要handler处理receive方法,先回过头再来看下`NettyClient`的初始化化逻辑,看构造方法里有一段调用了父类的`wrapChannelHandler()`方法，通过方法名可以看出，这是在初始化父类的handler实例，并且这个handler被包装了。同时可以看到`NettyHanler`是处理Netty读写事件的handler
+发送完request之后还得处理返回的response，response的处理应该由handler来完成，即应该由底层io捕捉读事件，把收到的response传到transport层。`NettyHanler`是处理Netty读写事件的handler。
+先回过头再来看下`NettyClient`的初始化化逻辑,构造方法里有一段逻辑调用了父类的`wrapChannelHandler()`方法，通过方法名可以看出，这是在初始化父类的handler实例，并且这个handler被包装了。
 ```java
 public class NettyClient extends AbstractClient {
 
@@ -214,7 +218,7 @@ public class NettyClient extends AbstractClient {
 
 }
 ```
-点击`wrapChannelHandler()`方法，最后看到的是这样一段逻辑:
+进入`wrapChannelHandler()`方法，最后看到的是这样一段逻辑:
 ```java
 public class ChannelHandlers {
 
@@ -242,10 +246,9 @@ public class ChannelHandlers {
       }
     }
   ```
-可以看到`MultiMessageHandler`包装了`HeartbeatHandler`,`HeartbeatHandler`又把请求代理给了`Dispatcher`,我们看下dispatcher包下的类可以看到实现了很多dispatcher方法，
-大概有`AllDispatcher`,`DirectDispatcher`,`ExecutionDispatcher`,`MessageOnlyDispatcher` 几个工厂类，默认使用的是AllDispatcher，即把请求代理给了`AllChannelHandler`，回头再来看`AllChannelHandler`的实现。
+可以看到`MultiMessageHandler`包装了`HeartbeatHandler`,`HeartbeatHandler`又把请求代理给了`Dispatcher`,Dispatcher大概有`AllDispatcher`,`DirectDispatcher`,`ExecutionDispatcher`,`MessageOnlyDispatcher` 几个实现，默认使用的是AllDispatcher，即把请求代理给了`AllChannelHandler`，回头再来看`AllChannelHandler`的实现细节。
 
-先看下`NettyClient`的继承关系：`NettyClient extend AbstractClient extend AbstractEndpoint extend AbstractPeer`，通过查看多个父类，可以看到是`AbstractPeer`的初始逻辑
+再看下`NettyClient`的继承关系：`NettyClient extend AbstractClient extend AbstractEndpoint extend AbstractPeer`，通过查看多个父类，可以看到是`AbstractPeer`的初始逻辑
 ```java
 public abstract class AbstractPeer implements Endpoint, ChannelHandler {
 
@@ -279,7 +282,7 @@ public abstract class AbstractPeer implements Endpoint, ChannelHandler {
            handler.received(ch, msg);
        }
   ```
-把client的handler初始化逻辑说完了，再回到`NettyHandler`处理receive()方法:
+把client的handler初始化逻辑说完了，再回到`NettyHandler`的receive()方法:
 ```java
 @Override
    public void messageReceived(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
@@ -291,12 +294,10 @@ public abstract class AbstractPeer implements Endpoint, ChannelHandler {
        }
    }
   ```
-可以看到在收到Netty的读事件后，是直接把请求又转发给了handler,也就是`NettyClient`的receive()方法去处理。
+可以看到在收到Netty的读事件后，是直接把请求又转发给了handler,也就是`NettyClient`的receive()方法去处理,也就是其父类的receive方法
 
----
-** 执行消息解码的handler处理过程
-
-`AbstractPeer`的handler实例是`MultiMessageHandler`,`MultiMessageHandler extends AbstractChannelHandlerDelegate`，重写了receive方法，看样子是实现组合消息的解码，暂时不知道如何使用，这里直接跳过，进入到`HeartbeatHanler` .
+到这一步等于收到的response被从底层被传递到了transport层和exchanger层。
+因为`AbstractPeer`的handler实例是`MultiMessageHandler`，所以请求到了`MultiMessageHandler`,这个handler重写了receive方法，看样子是实现组合消息的解码，暂时不知道如何使用，这里直接跳过，进入到`HeartbeatHanler` .
 ```java
 @Override
     public void received(Channel channel, Object message) throws RemotingException {
@@ -311,7 +312,7 @@ public abstract class AbstractPeer implements Endpoint, ChannelHandler {
     }
 ```
 
-`HeartbeatHanler extends AbstractChannelHandlerDelegate`， 是判断收到的请求是否与心跳相关，如果是心跳request，则回复消息，如果是心跳response，则消息到此结束，不再回复. handler实例是AllChannelHandler
+`HeartbeatHanler extends AbstractChannelHandlerDelegate`， 是判断收到的请求是否与心跳相关，如果是心跳request，则回复消息，如果是心跳response，则消息到此结束，不再回复.
 ```java
 @Override
    public void received(Channel channel, Object message) throws RemotingException {
@@ -343,7 +344,7 @@ public abstract class AbstractPeer implements Endpoint, ChannelHandler {
        //不是心跳 最后接着转发给下一个handler
        handler.received(channel, message);
 ```
-到这里就进入了dispatcher的逻辑了，前面已经介绍过了，Dispatcher由`AllChannelHandler`来实现，`AllChannelHandler` extends `WrappedChannelHandler`,这个handler的作用就是同步转异步，把请求异步转发给下一个handler实例处理(`ChannelEventRunnable`内部实现就是转发handler事件)，如果没有理解错，之前的几个handler处理解是由Netty的线程处理，到这一步Netty的线程就执行完毕空闲了。
+HeartbeatHanler的handler实例是AllChannelHandler，到这里就进入了dispatcher的逻辑了，前面已经介绍过了，Dispatcher由`AllChannelHandler`来实现,这个handler的作用就是同步转异步，把请求异步转发给下一个handler实例处理(ChannelEventRunnable内部实现就是转发handler事件)，如果没有理解错，之前的几个handler处理解是由Netty的线程处理，到这一步Netty的线程就执行完毕空闲了。
 
 ```java
 public class AllChannelHandler extends WrappedChannelHandler {
@@ -452,7 +453,7 @@ public class DecodeHandler extends AbstractChannelHandlerDelegate {
 }
 ```
 
-在上一篇文章`DubboProtocol`分析中已经知道,`DecodeHandler`的handler实例是HeaderExchangeHandler,再看HeaderExchangeHandler的实现,该类实现了Channel的所有事件处理，到这一步数据已经从Transport层流回流到了Exchange层。HeaderExchangeHandler是一个比较重要的类，把其中两个重要的方法贴出来：
+在上一篇文章DubboProtocol分析中已经知道,DecodeHandler的handler实例是HeaderExchangeHandler,再看HeaderExchangeHandler的实现,该类实现了Channel的所有事件处理，到这一步数据已经从Transport层流回流到了Exchange层。HeaderExchangeHandler是一个比较重要的类，把其中两个重要的方法贴出来：
 ```java
 public void received(Channel channel, Object message) throws RemotingException {
        channel.setAttribute(KEY_READ_TIMESTAMP, System.currentTimeMillis());
@@ -601,5 +602,3 @@ public void received(Channel channel, Object message) throws RemotingException {
         return returnFromResponse();
     }
  ```
-
-HeaderExchangeHandler 的handler实例是DubboProtocol里的一个`requestHandler`实例
